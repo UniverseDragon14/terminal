@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# pi5ctl - Local Wi-Fi Pi5 controller for Termux.
+# Safe design: SSH-only, LAN-only by default, no passwords/tokens stored, no public tunnel.
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pi5ctl"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+PI5_USER="${PI5_USER:-aslam}"
+PI5_HOST="${PI5_HOST:-192.168.1.80}"
+PI5_PROJECT_DIR="${PI5_PROJECT_DIR:-/home/aslam/novakutty-whatsapp-approval}"
+PI5_PM2_APP="${PI5_PM2_APP:-novakutty-whatsapp}"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+SSH_OPTS=(
+  -4
+  -o PreferredAuthentications=password
+  -o PubkeyAuthentication=no
+  -o ConnectTimeout=30
+  -o ServerAliveInterval=20
+  -o ServerAliveCountMax=3
+  -o IPQoS=none
+)
+
+say() { printf '%s\n' "$*"; }
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+PI5_USER="$PI5_USER"
+PI5_HOST="$PI5_HOST"
+PI5_PROJECT_DIR="$PI5_PROJECT_DIR"
+PI5_PM2_APP="$PI5_PM2_APP"
+EOF
+  say "✅ Saved config: $CONFIG_FILE"
+}
+
+usage() {
+  cat <<'EOF'
+pi5ctl - control your Raspberry Pi 5 from Huawei Termux over local Wi-Fi
+
+Usage:
+  pi5ctl setup [user] [host]        Save Pi login, example: pi5ctl setup aslam 192.168.1.80
+  pi5ctl scan [subnet]              Show LAN hosts with SSH open, example: pi5ctl scan 192.168.1.0/24
+  pi5ctl trust                      Add/check SSH host key for configured Pi
+  pi5ctl ssh                        Open interactive SSH session
+  pi5ctl status                     Pi health, disk, RAM, SSH, PM2 bot status
+  pi5ctl bot                        PM2 status for Novakutty bot
+  pi5ctl watchdog                   Run tools/nova_watchdog.sh if present
+  pi5ctl logs [lines]               Show PM2 logs, default 80 lines
+  pi5ctl restart-bot                Restart Novakutty PM2 app safely
+  pi5ctl start-bot                  Start Novakutty PM2 app from project dir
+  pi5ctl stop-bot                   Stop Novakutty PM2 app
+  pi5ctl check-env                  Check required env names without printing secrets
+  pi5ctl reboot                     Reboot Pi after typing YES
+  pi5ctl help                       Show this help
+
+Environment overrides:
+  PI5_USER, PI5_HOST, PI5_PROJECT_DIR, PI5_PM2_APP
+
+Security:
+  - No Tailscale, no public port forwarding, no reverse shell.
+  - Uses SSH only on your local Wi-Fi.
+  - Does not store passwords, API keys, OTPs, or tokens.
+EOF
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    err "Missing command: $1"
+    case "$1" in
+      ssh|ssh-keyscan) say "Install: pkg install openssh" ;;
+      nc) say "Install: pkg install netcat-openbsd" ;;
+      nmap) say "Optional install: pkg install nmap" ;;
+    esac
+    exit 1
+  }
+}
+
+remote() {
+  require_cmd ssh
+  ssh "${SSH_OPTS[@]}" "$PI5_USER@$PI5_HOST" "$@"
+}
+
+cmd_setup() {
+  PI5_USER="${1:-$PI5_USER}"
+  PI5_HOST="${2:-$PI5_HOST}"
+  PI5_PROJECT_DIR="${3:-$PI5_PROJECT_DIR}"
+  PI5_PM2_APP="${4:-$PI5_PM2_APP}"
+  save_config
+  say "Next: pi5ctl trust && pi5ctl status"
+}
+
+cmd_scan() {
+  local subnet="${1:-192.168.1.0/24}"
+  say "🔎 Scanning LAN SSH only: $subnet"
+  if command -v nmap >/dev/null 2>&1; then
+    nmap -p 22 --open "$subnet"
+  else
+    require_cmd nc
+    say "nmap missing, using simple 192.168.1.x scan. This is slower because computers enjoy drama."
+    local base="${subnet%.*}"
+    [[ "$subnet" == */* ]] && base="192.168.1"
+    for i in $(seq 1 254); do
+      local ip="$base.$i"
+      if nc -z -w 1 "$ip" 22 2>/dev/null; then
+        say "$ip 22/tcp open ssh"
+      fi
+    done
+  fi
+}
+
+cmd_trust() {
+  require_cmd ssh-keyscan
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  say "🔐 Fetching SSH host key for $PI5_HOST"
+  ssh-keyscan -T 10 "$PI5_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+  sort -u "$HOME/.ssh/known_hosts" -o "$HOME/.ssh/known_hosts"
+  say "✅ known_hosts updated"
+}
+
+cmd_status() {
+  remote bash -lc "'
+set -e
+printf "---- HOST ----\n"
+hostnamectl 2>/dev/null | sed -n "1,8p" || hostname
+printf "---- IP ----\n"
+hostname -I 2>/dev/null || true
+printf "---- UPTIME ----\n"
+uptime
+printf "---- DISK ----\n"
+df -h / /home 2>/dev/null || df -h /
+printf "---- RAM ----\n"
+free -h
+printf "---- SSH ----\n"
+systemctl is-active ssh 2>/dev/null || systemctl is-active sshd 2>/dev/null || true
+printf "---- PM2 ----\n"
+if command -v pm2 >/dev/null 2>&1; then pm2 status; else echo "pm2 missing"; fi
+'"
+}
+
+cmd_bot() {
+  remote bash -lc "'if command -v pm2 >/dev/null 2>&1; then pm2 status; else echo pm2_missing; fi'"
+}
+
+cmd_watchdog() {
+  remote bash -lc "'
+cd "$PI5_PROJECT_DIR" 2>/dev/null || { echo "project_missing: $PI5_PROJECT_DIR"; exit 1; }
+if [[ -x tools/nova_watchdog.sh ]]; then
+  tools/nova_watchdog.sh
+elif [[ -f tools/nova_watchdog.sh ]]; then
+  bash tools/nova_watchdog.sh
+else
+  echo "watchdog_missing"
+  pm2 status "$PI5_PM2_APP" 2>/dev/null || pm2 status 2>/dev/null || true
+fi
+'"
+}
+
+cmd_logs() {
+  local lines="${1:-80}"
+  remote bash -lc "'pm2 logs "$PI5_PM2_APP" --lines "$lines" --nostream'"
+}
+
+cmd_restart_bot() {
+  remote bash -lc "'
+cd "$PI5_PROJECT_DIR" || exit 1
+node --check bot.js
+pm2 restart "$PI5_PM2_APP" --update-env
+pm2 save
+pm2 status "$PI5_PM2_APP"
+'"
+}
+
+cmd_start_bot() {
+  remote bash -lc "'
+cd "$PI5_PROJECT_DIR" || exit 1
+node --check bot.js
+pm2 start bot.js --name "$PI5_PM2_APP" --update-env || pm2 restart "$PI5_PM2_APP" --update-env
+pm2 save
+pm2 status "$PI5_PM2_APP"
+'"
+}
+
+cmd_stop_bot() {
+  remote bash -lc "'pm2 stop "$PI5_PM2_APP" || true; pm2 save; pm2 status'"
+}
+
+cmd_check_env() {
+  remote bash -lc "'
+cd "$PI5_PROJECT_DIR" || exit 1
+node - <<"NODE"
+const fs = require("fs");
+const path = ".env";
+const txt = fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
+for (const k of ["GROQ_API_KEY","GEMINI_API_KEY","BRAVE_SEARCH_API_KEY","HUBSPOT_ACCESS_TOKEN","VOICE_TTS_PROVIDER"]) {
+  const line = txt.split(/\r?\n/).find(x => x.startsWith(k + "="));
+  const v = line ? line.slice(k.length + 1).trim() : "";
+  console.log(k, v ? `OK len=${v.length}` : "MISSING");
+}
+NODE
+'"
+}
+
+cmd_reboot() {
+  say "⚠️ This will reboot $PI5_HOST. Type YES to continue:"
+  read -r answer
+  [[ "$answer" == "YES" ]] || { say "Cancelled"; exit 0; }
+  remote sudo reboot
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    scan) cmd_scan "$@" ;;
+    trust) cmd_trust ;;
+    ssh) remote ;;
+    status) cmd_status ;;
+    bot) cmd_bot ;;
+    watchdog) cmd_watchdog ;;
+    logs) cmd_logs "$@" ;;
+    restart-bot) cmd_restart_bot ;;
+    start-bot) cmd_start_bot ;;
+    stop-bot) cmd_stop_bot ;;
+    check-env) cmd_check_env ;;
+    reboot) cmd_reboot ;;
+    help|-h|--help) usage ;;
+    *) err "Unknown command: $cmd"; usage; exit 2 ;;
+  esac
+}
+
+main "$@"
